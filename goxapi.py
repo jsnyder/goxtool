@@ -43,7 +43,6 @@ import logging
 import Queue
 import time
 import datetime
-import calendar
 import traceback
 import threading
 from urllib2 import Request as URLRequest
@@ -653,12 +652,12 @@ class BaseClient(BaseObject):
 
         # Gox() will have set this field to the timestamp of the last
         # known candle, so we only request data since this time
+        endtime = datetime.datetime.now()
         if self.history_last_candle:
             since = self.history_last_candle
         else:
-            endtime = datetime.datetime.now()
-            starttime = endtime - datetime.timedelta(days=3)
-            since = int(calendar.timegm(starttime.timetuple()))
+            starttime = endtime - datetime.timedelta(days=2)
+            since = int(time.mktime(starttime.timetuple()))
 
 
 
@@ -682,11 +681,13 @@ class BaseClient(BaseObject):
                     + "/api/2/BTC" + self.currency + "/money/trades"
                     + querystring)
                 history = json.loads(json_hist)
+                if len(history["data"]) == 0:
+                    break
                 data  += history["data"]
                 querystring = "?since=" + data[-1]["tid"]
-                print int(calendar.timegm(endtime.timetuple())) - int(data[-1]["date"]) 
-                if int(data[-1]["date"]) > int(calendar.timegm(endtime.timetuple())):
-                    break
+                self.debug("seconds behind: %d" % (int(time.mktime(endtime.timetuple())) - int(data[-1]["date"])))
+                if int(data[-1]["date"]) > int(time.mktime(endtime.timetuple())):
+                     break
             if history["result"] == "success":
                 self.signal_fullhistory(self, data)
 

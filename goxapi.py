@@ -46,7 +46,7 @@ import datetime
 import traceback
 import threading
 from urllib2 import Request as URLRequest
-from urllib2 import urlopen
+from urllib2 import urlopen, HTTPError
 from urllib import urlencode
 import weakref
 import websocket
@@ -57,6 +57,12 @@ FORCE_PROTOCOL = ""
 FORCE_NO_FULLDEPTH = False
 FORCE_NO_HISTORY = False
 FORCE_HTTP_API = False
+
+SOCKETIO_HOST = "socketio.mtgox.com"
+WEBSOCKET_HOST = "websocket.mtgox.com"
+HTTP_HOST = "data.mtgox.com"
+
+USER_AGENT = "goxtool.py"
 
 def int2str(value_int, currency):
     """return currency integer formatted as a string"""
@@ -79,24 +85,38 @@ def int2float(value_int, currency):
 def float2int(value_float, currency):
     """convert float value to integer, determine the factor by currency name"""
     if currency == "BTC":
-        return int(value_float * 100000000)
+        return int(round(value_float * 100000000))
     if currency == "JPY":
-        return int(value_float * 1000)
+        return int(round(value_float * 1000))
     else:
-        return int(value_float * 100000)
+        return int(round(value_float * 100000))
 
-def http_request(url):
+def http_request(url, post=None, headers=None):
     """request data from the HTTP API, returns a string"""
-    request = URLRequest(url)
-    request.add_header('Accept-encoding', 'gzip')
-    data = ""
-    with contextlib.closing(urlopen(request)) as response:
+
+    def read_gzipped(response):
+        """read data from the response object,
+        unzip if necessary, return text string"""
         if response.info().get('Content-Encoding') == 'gzip':
             with io.BytesIO(response.read()) as buf:
                 with gzip.GzipFile(fileobj=buf) as unzipped:
                     data = unzipped.read()
         else:
             data = response.read()
+        return data
+
+    if not headers:
+        headers = {}
+    request = URLRequest(url, post, headers)
+    request.add_header('Accept-encoding', 'gzip')
+    request.add_header('User-Agent:', USER_AGENT)
+    data = ""
+    try:
+        with contextlib.closing(urlopen(request, post)) as res:
+            data = read_gzipped(res)
+    except HTTPError as err:
+        data = read_gzipped(err)
+
     return data
 
 def start_thread(thread_func):
@@ -128,11 +148,12 @@ class GoxConfig(SafeConfigParser):
 
     _DEFAULTS = [["gox", "currency", "USD"]
                 ,["gox", "use_ssl", "True"]
-                ,["gox", "use_plain_old_websocket", "False"]
+                ,["gox", "use_plain_old_websocket", "True"]
                 ,["gox", "use_http_api", "False"]
                 ,["gox", "load_fulldepth", "True"]
                 ,["gox", "load_history", "True"]
                 ,["gox", "history_timeframe", "15"]
+                ,["gox", "history_length_days", "2"]
                 ,["gox", "secret_key", ""]
                 ,["gox", "secret_secret", ""]
                 ,["goxtool", "set_xterm_title", "True"]
@@ -563,10 +584,6 @@ class History(BaseObject):
 class BaseClient(BaseObject):
     """abstract base class for SocketIOClient and WebsocketClient"""
 
-    SOCKETIO_HOST = "socketio.mtgox.com"
-    WEBSOCKET_HOST = "websocket.mtgox.com"
-    HTTP_HOST = "data.mtgox.com"
-
     _last_nonce = 0
     _nonce_lock = threading.Lock()
 
@@ -641,7 +658,7 @@ class BaseClient(BaseObject):
             self.debug("requesting initial full depth")
             use_ssl = self.config.get_bool("gox", "use_ssl")
             proto = {True: "https", False: "http"}[use_ssl]
-            fulldepth = http_request(proto + "://" +  self.HTTP_HOST \
+            fulldepth = http_request(proto + "://" +  HTTP_HOST \
                 + "/api/2/BTC" + self.currency + "/money/depth/full")
             self.signal_fulldepth(self, (json.loads(fulldepth)))
 
@@ -652,11 +669,13 @@ class BaseClient(BaseObject):
 
         # Gox() will have set this field to the timestamp of the last
         # known candle, so we only request data since this time
-        endtime = datetime.datetime.now()
         if self.history_last_candle:
             since = self.history_last_candle
         else:
-            starttime = endtime - datetime.timedelta(days=2)
+            days = config.get_int("gox", "history_length_days")
+            if not days:
+                days = 2
+            starttime = endtime - datetime.timedelta(days=days)
             since = int(time.mktime(starttime.timetuple()))
 
 
@@ -677,7 +696,8 @@ class BaseClient(BaseObject):
             proto = {True: "https", False: "http"}[use_ssl]
             data = []
             while True:
-                json_hist = http_request(proto + "://" +  self.HTTP_HOST \
+                endtime = datetime.datetime.now()
+                json_hist = http_request(proto + "://" +  HTTP_HOST \
                     + "/api/2/BTC" + self.currency + "/money/trades"
                     + querystring)
                 history = json.loads(json_hist)
@@ -728,6 +748,7 @@ class BaseClient(BaseObject):
         """send queued http requests to the http API (only used when
         http api is forced, normally this is much slower)"""
         while not self._terminating:
+            # pop queued request from the queue and process it
             (api_endpoint, params, reqid) = self.http_requests.get(True)
             try:
                 answer = self.http_signed_call(api_endpoint, params)
@@ -738,14 +759,27 @@ class BaseClient(BaseObject):
                     ret = {"op": "result", "id": reqid, "result": answer["data"]}
                     self.signal_recv(self, (json.dumps(ret)))
                 else:
-                    self.debug("### error:", answer, reqid)
-                    #self.enqueue_http_request((api_endpoint, params, reqid))
+                    if "error" in answer:
+                        # these are errors like "Order amount is too low"
+                        # or "Order not found" and the like, we send them
+                        # to signal_recv() as if they had come from the
+                        # streaming API beause Gox() can handle these errors.
+                        fake_remark_msg = {
+                            "op": "remark",
+                            "success": False,
+                            "message": answer["error"],
+                            "id": reqid
+                        }
+                        self.signal_recv(self, (json.dumps(fake_remark_msg)))
+                    else:
+                        self.debug("### unexpected http result:", answer, reqid)
 
             except Exception as exc:
-                self.debug("### error:", exc, api_endpoint, params, reqid)
-                if "500" in str(exc):
-                    continue
-                self.enqueue_http_request(api_endpoint, params, reqid)
+                # should this ever happen? HTTP 5xx wont trigger this,
+                # something else must have gone wrong, a totally malformed
+                # reply or something else. Log the error and don't retry
+                self.debug("### exception in _http_thread_func:",
+                    exc, api_endpoint, params, reqid)
 
             self.http_requests.task_done()
 
@@ -771,19 +805,20 @@ class BaseClient(BaseObject):
         sign = hmac.new(base64.b64decode(sec), prefix + post, hashlib.sha512).digest()
 
         headers = {
-            'User-Agent': 'goxtool.py',
             'Rest-Key': key,
             'Rest-Sign': base64.b64encode(sign)
         }
 
         use_ssl = self.config.get_bool("gox", "use_ssl")
         proto = {True: "https", False: "http"}[use_ssl]
-        url = proto + "://" + self.HTTP_HOST + "/api/2/" + api_endpoint
+        url = proto + "://" + HTTP_HOST + "/api/2/" + api_endpoint
 
         self.debug("### (%s) calling %s" % (proto, url))
-        req = URLRequest(url, post, headers)
-        with contextlib.closing(urlopen(req, post)) as res:
-            return json.load(res)
+        return json.loads(http_request(url, post, headers))
+
+        #req = URLRequest(url, post, headers)
+        #with contextlib.closing(urlopen(req, post)) as res:
+        #    return json.load(res)
 
 
     def send_signed_call(self, api_endpoint, params, reqid):
@@ -861,6 +896,7 @@ class WebsocketClient(BaseClient):
 
     def __init__(self, currency, secret, config):
         BaseClient.__init__(self, currency, secret, config)
+        self.hostname = WEBSOCKET_HOST
 
     def _recv_thread_func(self):
         """connect to the websocket and start receiving in an infinite loop.
@@ -869,15 +905,21 @@ class WebsocketClient(BaseClient):
         reconnect_time = 1
         use_ssl = self.config.get_bool("gox", "use_ssl")
         wsp = {True: "wss://", False: "ws://"}[use_ssl]
+        port = {True: 443, False: 80}[use_ssl]
+        ws_origin = "%s:%d" % (self.hostname, port)
+        ws_headers = ["User-Agent: %s" % USER_AGENT]
         while not self._terminating:  #loop 0 (connect, reconnect)
             try:
-                ws_url = wsp + self.WEBSOCKET_HOST \
+                ws_url = wsp + self.hostname \
                     + "/mtgox?Currency=" + self.currency
 
                 self.debug("trying plain old Websocket: %s ... " % ws_url)
 
                 self.socket = websocket.WebSocket()
-                self.socket.connect(ws_url)
+                # The server is somewhat picky when it comes to the exact
+                # host:port syntax of the origin header, so I am supplying
+                # my own origin header instead of the auto-generated one
+                self.socket.connect(ws_url, origin=ws_origin, header=ws_headers)
                 self._time_last_received = time.time()
                 self.connected = True
                 self.debug("connected, subscribing needed channels")
@@ -943,7 +985,7 @@ class SocketIO(websocket.WebSocket):
             path_a += "?" + options["query"]
         self.io_sock.send("GET %s HTTP/1.1\r\n" % path_a)
         self.io_sock.send("Host: %s:%d\r\n" % (hostname, port))
-        self.io_sock.send("User-Agent: goxtool.py\r\n")
+        self.io_sock.send("User-Agent: %s\r\n" % USER_AGENT)
         self.io_sock.send("Accept: text/plain\r\n")
         self.io_sock.send("Connection: keep-alive\r\n")
         self.io_sock.send("\r\n")
@@ -973,7 +1015,7 @@ class SocketIOClient(BaseClient):
 
     def __init__(self, currency, secret, config):
         BaseClient.__init__(self, currency, secret, config)
-        self.hostname = self.SOCKETIO_HOST
+        self.hostname = SOCKETIO_HOST
         self._timer.connect(self.slot_keepalive_timer)
 
     def _recv_thread_func(self):
@@ -1086,7 +1128,7 @@ class Gox(BaseObject):
         use_websocket = self.config.get_bool("gox", "use_plain_old_websocket")
         if "socketio" in FORCE_PROTOCOL:
             use_websocket = False
-        if FORCE_PROTOCOL == "websocket":
+        if "websocket" in FORCE_PROTOCOL:
             use_websocket = True
         if use_websocket:
             self.client = WebsocketClient(self.currency, secret, config)
@@ -1212,6 +1254,7 @@ class Gox(BaseObject):
             for currency in gox_wallet:
                 self.wallet[currency] = int(
                     gox_wallet[currency]["Balance"]["value_int"])
+
             self.signal_wallet(self, ())
 
         elif reqid == "order_lag":
@@ -1349,6 +1392,12 @@ class Gox(BaseObject):
             if msg["message"] == "Invalid call":
                 self._on_invalid_call(msg)
                 return
+            if msg["message"] == "Order not found":
+                self._on_order_not_found(msg)
+                return
+            if msg["message"] == "Order amount is too low":
+                self._on_order_amount_too_low(msg)
+                return
 
         # we should log this, helps with debugging
         self.debug(msg)
@@ -1392,6 +1441,22 @@ class Gox(BaseObject):
 
         else:
             self.debug("_on_invalid_call() ignoring:", msg)
+
+    def _on_order_not_found(self, msg):
+        """this means we have sent order/cancel with non-existing oid"""
+        parts = msg["id"].split(":")
+        oid = parts[1]
+        self.debug("### got 'Order not found' for", oid)
+        # we are now going to fake a user_order message (the one we
+        # obviously missed earlier) that will have the effect of
+        # removing the order cleanly.
+        fakemsg = {"user_order": {"oid": oid}}
+        self._on_op_private_user_order(fakemsg)
+
+    def _on_order_amount_too_low(self, _msg):
+        """we received an order_amount too low message."""
+        self.debug("Server said: 'Order amount is too low'")
+        self.count_submitted -= 1
 
 
 class Order:
@@ -1659,15 +1724,16 @@ class OrderBook(BaseObject):
         """called by gox when the initial order list is downloaded,
         this will happen after connect or reconnect"""
         self.owns = []
-        for order in own_orders:
-            if order["currency"] == self.gox.currency:
-                self._add_own(Order(
-                    int(order["price"]["value_int"]),
-                    int(order["amount"]["value_int"]),
-                    order["type"],
-                    order["oid"],
-                    order["status"]
-                ))
+        if own_orders:
+            for order in own_orders:
+                if order["currency"] == self.gox.currency:
+                    self._add_own(Order(
+                        int(order["price"]["value_int"]),
+                        int(order["amount"]["value_int"]),
+                        order["type"],
+                        order["oid"],
+                        order["status"]
+                    ))
 
         self.signal_changed(self, None)
         self.signal_owns_changed(self, None)

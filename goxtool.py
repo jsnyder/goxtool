@@ -464,6 +464,7 @@ class WinStatus(Win):
         self.gox = gox
         self.order_lag = 0
         self.order_lag_txt = ""
+        self.sorted_currency_list = []
         gox.signal_orderlag.connect(self.slot_orderlag)
         gox.signal_wallet.connect(self.slot_changed)
         gox.orderbook.signal_changed.connect(self.slot_changed)
@@ -473,14 +474,31 @@ class WinStatus(Win):
         """place it at the top of the terminal"""
         self.height = HEIGHT_STATUS
 
+    def sort_currency_list_if_changed(self):
+        """sort the currency list in the wallet for better display,
+        sort it only if it has changed, otherwise leave it as it is"""
+        currency_list = self.gox.wallet.keys()
+        if len(currency_list) == len(self.sorted_currency_list):
+            return
+
+        # now we will bring BTC and gox.currency to the front and sort the
+        # the rest of the list of names by acount balance in descending order
+        currency_list.remove("BTC")
+        currency_list.remove(self.gox.currency)
+        currency_list.sort(key=lambda name: -self.gox.wallet[name])
+        currency_list.insert(0, self.gox.currency)
+        currency_list.insert(0, "BTC")
+        self.sorted_currency_list = currency_list
+
     def paint(self):
         """paint the complete status"""
+        self.sort_currency_list_if_changed()
         self.win.bkgd(" ", COLOR_PAIR["status_text"])
         self.win.erase()
         line1 = "Currency: " + self.gox.currency + " | "
         line1 += "Account: "
-        if len(self.gox.wallet):
-            for currency in self.gox.wallet:
+        if len(self.sorted_currency_list):
+            for currency in self.sorted_currency_list:
                 line1 += currency + " " \
                 + goxapi.int2str(self.gox.wallet[currency], currency).strip() \
                 + " + "
@@ -722,6 +740,7 @@ class TextBox():
         position. This is only a cosmetic problem but very annnoying. Try to
         force it into the edit field by repainting it very often."""
         while self.editing:
+            # pylint: disable=W0212
             with goxapi.Signal._lock:
                 self.win.touchwin()
                 self.win.refresh()
@@ -870,7 +889,8 @@ class LogWriter():
     # pylint: disable=R0201
     def slot_debug(self, sender, (msg)):
         """handler for signal_debug signals"""
-        logging.debug("%s:%s", sender.__class__.__name__, msg)
+        name = "%s.%s" % (sender.__class__.__module__, sender.__class__.__name__)
+        logging.debug("%s:%s", name, msg)
 
 
 class PrintHook():
@@ -903,35 +923,36 @@ class PrintHook():
 class StrategyManager():
     """load the strategy module"""
 
-    def __init__(self, gox, strategy_module_name):
-        self.strategy_object = None
-        self.strategy_module_name = strategy_module_name
+    def __init__(self, gox, strategy_name_list):
+        self.strategy_object_list = []
+        self.strategy_name_list = strategy_name_list
         self.gox = gox
         self.reload()
 
     def unload(self):
         """unload the strategy, will trigger its the __del__ method"""
         self.gox.signal_strategy_unload(self, None)
-        self.strategy_object = None
+        self.strategy_object_list = []
 
     def reload(self):
         """reload and re-initialize the strategy module"""
-        try:
-            strategy_module = __import__(self.strategy_module_name)
+        self.unload()
+        for name in self.strategy_name_list:
+            name = name.replace(".py", "").strip()
+
             try:
-                self.unload()
-                reload(strategy_module)
-                self.strategy_object = strategy_module.Strategy(self.gox)
+                strategy_module = __import__(name)
+                try:
+                    reload(strategy_module)
+                    strategy_object = strategy_module.Strategy(self.gox)
+                    self.strategy_object_list.append(strategy_object)
 
-            # pylint: disable=W0703
-            except Exception:
-                self.gox.debug(traceback.format_exc())
+                # pylint: disable=W0703
+                except Exception:
+                    self.gox.debug(traceback.format_exc())
 
-        except ImportError:
-            self.gox.debug("### could not import %s.py"
-                % self.strategy_module_name)
-            self.gox.debug("### running without strategy module")
-
+            except ImportError:
+                self.gox.debug("### could not import %s.py" % name)
 
 
 #
@@ -956,7 +977,7 @@ def main():
 
         logwriter = LogWriter(gox)
         printhook = PrintHook(gox)
-        strategy_manager = StrategyManager(gox, strat_mod_name)
+        strategy_manager = StrategyManager(gox, strat_mod_list)
 
         gox.start()
         try:
@@ -971,6 +992,7 @@ def main():
                 if key == curses.KEY_F6:
                     DlgCancelOrders(stdscr, gox).modal()
                 if key == curses.KEY_RESIZE:
+                    # pylint: disable=W0212
                     with goxapi.Signal._lock:
                         stdscr.erase()
                         stdscr.refresh()
@@ -1011,7 +1033,7 @@ def main():
     argp.add_argument('--add-secret', action="store_true",
         help="prompt for API secret, encrypt it and then exit")
     argp.add_argument('--strategy', action="store", default="strategy.py",
-        help="name of strategy module file, default=strategy.py")
+        help="name of strategy module files, comma separated list, default=strategy.py")
     argp.add_argument('--protocol', action="store", default="",
         help="force protocol (socketio or websocket), ignore setting in .ini")
     argp.add_argument('--no-fulldepth', action="store_true", default="",
@@ -1028,7 +1050,7 @@ def main():
         # prompt for secret, encrypt, write to .ini and then exit the program
         secret.prompt_encrypt()
     else:
-        strat_mod_name = args.strategy.replace(".py", "")
+        strat_mod_list = args.strategy.split(",")
         goxapi.FORCE_PROTOCOL = args.protocol
         goxapi.FORCE_NO_FULLDEPTH = args.no_fulldepth
         goxapi.FORCE_NO_HISTORY = args.no_history

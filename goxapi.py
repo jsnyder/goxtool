@@ -672,10 +672,10 @@ class BaseClient(BaseObject):
         if self.history_last_candle:
             since = self.history_last_candle
         else:
-            days = config.get_int("gox", "history_length_days")
+            days = self.config.get_int("gox", "history_length_days")
             if not days:
                 days = 2
-            starttime = endtime - datetime.timedelta(days=days)
+            starttime = datetime.datetime.now() - datetime.timedelta(days=days)
             since = int(time.mktime(starttime.timetuple()))
 
 

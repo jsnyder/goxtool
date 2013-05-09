@@ -722,6 +722,7 @@ class BaseClient(BaseObject):
 
         # Gox() will have set this field to the timestamp of the last
         # known candle, so we only request data since this time
+        endtime = datetime.datetime.now()
         if self.history_last_candle:
             since = self.history_last_candle
         else:
@@ -749,7 +750,6 @@ class BaseClient(BaseObject):
             proto = {True: "https", False: "http"}[use_ssl]
             data = []
             while True:
-                endtime = datetime.datetime.now()
                 json_hist = http_request(proto + "://" +  HTTP_HOST \
                     + "/api/2/" + self.curr_base + self.curr_quote \
                     + "/money/trades" + querystring)
@@ -758,7 +758,7 @@ class BaseClient(BaseObject):
                     break
                 data  += history["data"]
                 querystring = "?since=" + data[-1]["tid"]
-                self.debug("seconds behind: %d" % (int(time.mktime(endtime.timetuple())) - int(data[-1]["date"])))
+                self.debug("download: %d (seconds behind)" % (int(time.mktime(endtime.timetuple())) - int(data[-1]["date"])))
                 if int(data[-1]["date"]) > int(time.mktime(endtime.timetuple())):
                      break
             if history["result"] == "success":

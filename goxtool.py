@@ -21,7 +21,7 @@ framework for experimenting with trading bots
 #  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
 #  MA 02110-1301, USA.
 
-# pylint: disable=C0301,C0302,R0902,R0903,R0912,R0913,R0915,R0922
+# pylint: disable=C0301,C0302,R0902,R0903,R0912,R0913,R0914,R0915,R0922,W0703
 
 import argparse
 import curses
@@ -31,6 +31,7 @@ import goxapi
 import logging
 import locale
 import math
+import os
 import sys
 import time
 import traceback
@@ -47,6 +48,8 @@ HEIGHT_CON      = 7
 WIDTH_ORDERBOOK = 45
 
 COLORS =    [["con_text",       curses.COLOR_BLUE,    curses.COLOR_CYAN]
+            ,["con_text_buy",   curses.COLOR_BLUE,    curses.COLOR_GREEN]
+            ,["con_text_sell",  curses.COLOR_BLUE,    curses.COLOR_RED]
             ,["status_text",    curses.COLOR_BLUE,    curses.COLOR_CYAN]
 
             ,["book_text",      curses.COLOR_BLACK,   curses.COLOR_BLUE]
@@ -226,7 +229,30 @@ class WinConsole(Win):
 
     def write(self, txt):
         """write a line of text, scroll if needed"""
-        self.win.addstr("\n" + txt,  COLOR_PAIR["con_text"])
+        # This code would break if the format of
+        # the log messages would ever change!
+
+
+        if " tick:" in txt:
+            if not self.gox.config.get_bool("goxtool", "show_ticker"):
+                return
+        if "depth:" in txt:
+            if not self.gox.config.get_bool("goxtool", "show_depth"):
+                return
+        if "trade:" in txt:
+            if "own order" in txt:
+                if not self.gox.config.get_bool("goxtool", "show_trade_own"):
+                    return
+            else:
+                if not self.gox.config.get_bool("goxtool", "show_trade"):
+                    return
+
+        col = COLOR_PAIR["con_text"]
+        if "trade: bid:" in txt:
+            col = COLOR_PAIR["con_text_buy"] + curses.A_BOLD
+        if "trade: ask:" in txt:
+            col = COLOR_PAIR["con_text_sell"] + curses.A_BOLD
+        self.win.addstr("\n" + txt,  col)
         self.done_paint()
 
 
@@ -248,6 +274,14 @@ class WinOrderBook(Win):
 
     def paint(self):
         """paint the visible portion of the orderbook"""
+
+        def paint_row(pos, price, vol, ownvol, color):
+            """paint a row in the orderbook (bid or ask)"""
+            self.addstr(pos, 0,  book.gox.quote2str(price), color)
+            self.addstr(pos, 12, book.gox.base2str(vol), col_vol)
+            if ownvol:
+                self.addstr(pos, 28, book.gox.base2str(ownvol), col_own)
+
         self.win.bkgd(" ",  COLOR_PAIR["book_text"])
         self.win.erase()
         mid = self.height / 2
@@ -256,33 +290,78 @@ class WinOrderBook(Win):
         col_vol = COLOR_PAIR["book_vol"]
         col_own = COLOR_PAIR["book_own"]
 
+        sum_total = self.gox.config.get_bool("goxtool", "orderbook_sum_total")
+        group = self.gox.config.get_float("goxtool", "orderbook_group")
+        group = self.gox.quote2int(group)
+        if group == 0:
+            group = 1
+
         # print the asks
-        # pylint: disable=C0301
         book = self.gox.orderbook
+        cnt = len(book.asks)
+
         pos = mid - 1
         i = 0
-        cnt = len(book.asks)
+        vol = 0
+        ownvol = 0
         while pos >= 0 and  i < cnt:
-            self.addstr(pos, 0,  goxapi.int2str(book.asks[i].price, book.gox.currency), col_ask)
-            self.addstr(pos, 12, goxapi.int2str(book.asks[i].volume, "BTC"), col_vol)
-            ownvol = book.get_own_volume_at(book.asks[i].price)
-            if ownvol:
-                self.addstr(pos, 28, goxapi.int2str(ownvol, "BTC"), col_own)
-            pos -= 1
+            price = book.asks[i].price
+            if i == 0:
+                this_bin = price
+                vol = book.asks[i].volume
+                ownvol = book.asks[i].own_volume
+            else:
+                if price <= this_bin:
+                    # still the same bin, add volumes
+                    vol += book.asks[i].volume
+                    ownvol += book.asks[i].own_volume
+                else:
+                    # paint the existing bin and...
+                    paint_row(pos, this_bin, vol, ownvol, col_ask)
+                    pos -= 1
+                    # ...begin a new bin
+                    this_bin = int(math.ceil(float(price) / group) * group)
+                    if sum_total:
+                        vol += book.asks[i].volume
+                    else:
+                        vol = book.asks[i].volume
+                    ownvol = book.asks[i].own_volume
             i += 1
+        if cnt and pos >= 0:
+            paint_row(pos, this_bin, vol, ownvol, col_ask)
 
         # print the bids
+        cnt = len(book.bids)
         pos = mid + 1
         i = 0
-        cnt = len(book.bids)
+        vol = 0
+        ownvol = 0
         while pos < self.height and  i < cnt:
-            self.addstr(pos, 0,  goxapi.int2str(book.bids[i].price, book.gox.currency), col_bid)
-            self.addstr(pos, 12, goxapi.int2str(book.bids[i].volume, "BTC"), col_vol)
-            ownvol = book.get_own_volume_at(book.bids[i].price)
-            if ownvol:
-                self.addstr(pos, 28, goxapi.int2str(ownvol, "BTC"), col_own)
-            pos += 1
+            price = book.bids[i].price
+            if i == 0:
+                this_bin = price
+                vol = book.bids[i].volume
+                ownvol = book.bids[i].own_volume
+            else:
+                if price >= this_bin:
+                    # still the same bin, add volumes
+                    vol += book.bids[i].volume
+                    ownvol += book.bids[i].own_volume
+                else:
+                    # paint the current bin and...
+                    paint_row(pos, this_bin, vol, ownvol, col_bid)
+                    pos += 1
+                    # ...begin a new bin
+                    this_bin = int(math.floor(float(price) / group) * group)
+                    if sum_total:
+                        vol += book.bids[i].volume
+                    else:
+                        vol = book.bids[i].volume
+                    ownvol = book.bids[i].own_volume
             i += 1
+        if cnt and pos < self.height:
+            paint_row(pos, this_bin, vol, ownvol, col_bid)
+
 
     def slot_changed(self, book, dummy_data):
         """Slot for orderbook.signal_changed"""
@@ -292,10 +371,10 @@ class WinOrderBook(Win):
         if self.gox.config.get_bool("goxtool", "set_xterm_title"):
             last_candle = self.gox.history.last_candle()
             if last_candle:
-                title = goxapi.int2str(last_candle.cls, self.gox.currency).strip()
+                title = self.gox.quote2str(last_candle.cls).strip()
                 title += " - goxtool -"
-                title += " bid:" + goxapi.int2str(book.bid, self.gox.currency).strip()
-                title += " ask:" + goxapi.int2str(book.ask, self.gox.currency).strip()
+                title += " bid:" + self.gox.quote2str(book.bid).strip()
+                title += " ask:" + self.gox.quote2str(book.ask).strip()
                 curses.putp("\033]0;%s\007" % title)
 
 
@@ -372,8 +451,135 @@ class WinChart(Win):
                     curses.ACS_VLINE, COLOR_PAIR["chart_text"])
 
     def paint(self):
-        """paint the visible portion of the chart"""
+        typ = self.gox.config.get_string("goxtool", "display_right")
+        try:
+            {"history_chart": self.paint_history_chart
+            ,"depth_chart": self.paint_depth_chart
+            }[typ]()
+        except KeyError:
+            self.paint_history_chart()
 
+    def paint_depth_chart(self):
+        """paint a depth chart"""
+
+        # pylint: disable=C0103
+        if self.gox.curr_quote == "JPY":
+            BAR_LEFT_EDGE = 7
+            FORMAT_STRING = "%6.0f"
+        else:
+            BAR_LEFT_EDGE = 8
+            FORMAT_STRING = "%7.2f"
+
+        def paint_depth(pos, price, vol, own, col_price):
+            """paint one row of the depth chart"""
+            pricestr = FORMAT_STRING % self.gox.quote2float(price)
+            self.addstr(pos, 0, pricestr, col_price)
+            length = int(vol * mult_x)
+            # pylint: disable=E1101
+            self.win.hline(pos, BAR_LEFT_EDGE, curses.ACS_CKBOARD, length, col_bar)
+            if own:
+                self.addstr(pos, length + BAR_LEFT_EDGE, "o", col_own)
+
+        self.win.bkgd(" ",  COLOR_PAIR["chart_text"])
+        self.win.erase()
+
+        book = self.gox.orderbook
+        if not book.bid or not book.ask:
+            # orderbook is not initialized yet, paint nothing
+            return
+
+        col_bar = COLOR_PAIR["book_vol"]
+        col_bid = COLOR_PAIR["book_bid"]
+        col_ask = COLOR_PAIR["book_ask"]
+        col_own = COLOR_PAIR["book_own"]
+
+        group = self.gox.config.get_float("goxtool", "depth_chart_group")
+        if group == 0:
+            group = 1
+        group = self.gox.quote2int(group)
+
+        bin_asks = []
+        bin_bids = []
+        mid = self.height / 2
+
+        # sum up the asks
+        cnt = len(book.asks)
+        bin_vol = 0
+        own_vol = 0
+        pos = mid - 1
+        i = 0
+        while i < cnt and pos >= 0:
+            level = book.asks[i]
+            price = level.price
+            if i == 0:
+                bin_price = int(math.ceil(float(price) / group) * group)
+            if price > bin_price:
+                bin_asks.append((bin_price, bin_vol, own_vol))
+                pos -= 1
+                bin_price = int(math.ceil(float(price) / group) * group)
+                own_vol = level.own_volume
+            else:
+                own_vol += level.own_volume
+            bin_vol += level.volume
+            i += 1
+
+        #append the last one
+        if bin_vol:
+            bin_asks.append((bin_price, bin_vol, own_vol))
+
+        max_vol_ask = bin_vol
+
+        # sum up the bids
+        cnt = len(book.bids)
+        bin_vol = 0
+        own_vol = 0
+        pos = mid + 1
+        i = 0
+        while i < cnt and pos < self.height:
+            level = book.bids[i]
+            price = level.price
+            if i == 0:
+                bin_price = int(math.floor(float(price) / group) * group)
+            if price < bin_price:
+                bin_bids.append((bin_price, bin_vol, own_vol))
+                pos += 1
+                bin_price = int(math.floor(float(price) / group) * group)
+                own_vol = level.own_volume
+            else:
+                own_vol += level.own_volume
+            bin_vol += level.volume * price / book.bid
+            i += 1
+
+        #append the last one
+        if bin_vol:
+            bin_bids.append((bin_price, bin_vol, own_vol))
+
+        max_vol_bid = bin_vol
+
+        if not max_vol_ask:
+            return
+        if not max_vol_bid:
+            return
+
+        max_vol_tot = max(max_vol_ask, max_vol_bid)
+        mult_x = float(self.width - BAR_LEFT_EDGE - 1) / max_vol_tot
+
+        # paint the asks
+        pos = mid - 1
+        while len(bin_asks) and pos >= 0:
+            (price, vol, own) = bin_asks.pop(0)
+            paint_depth(pos, price, vol, own, col_ask)
+            pos -= 1
+
+        # paint the bids
+        pos = mid + 1
+        while len(bin_bids) and pos < self.height:
+            (price, vol, own) = bin_bids.pop(0)
+            paint_depth(pos, price, vol, own, col_bid)
+            pos += 1
+
+    def paint_history_chart(self):
+        """paint a history candlestick chart"""
 
         self.win.bkgd(" ",  COLOR_PAIR["chart_text"])
         self.win.erase()
@@ -442,7 +648,7 @@ class WinChart(Win):
                 if posy < self.height - 1:
                     self.addstr(
                         posy, posx,
-                        goxapi.int2str(labelprice, self.gox.currency),
+                        self.gox.quote2str(labelprice),
                         COLOR_PAIR["chart_text"]
                     )
                 labelprice += step
@@ -481,27 +687,32 @@ class WinStatus(Win):
         if len(currency_list) == len(self.sorted_currency_list):
             return
 
-        # now we will bring BTC and gox.currency to the front and sort the
+        # now we will bring base and quote currency to the front and sort the
         # the rest of the list of names by acount balance in descending order
-        currency_list.remove("BTC")
-        currency_list.remove(self.gox.currency)
+        if self.gox.curr_base in currency_list:
+            currency_list.remove(self.gox.curr_base)
+        if self.gox.curr_quote in currency_list:
+            currency_list.remove(self.gox.curr_quote)
         currency_list.sort(key=lambda name: -self.gox.wallet[name])
-        currency_list.insert(0, self.gox.currency)
-        currency_list.insert(0, "BTC")
+        currency_list.insert(0, self.gox.curr_quote)
+        currency_list.insert(0, self.gox.curr_base)
         self.sorted_currency_list = currency_list
 
     def paint(self):
         """paint the complete status"""
+        cbase = self.gox.curr_base
+        cquote = self.gox.curr_quote
         self.sort_currency_list_if_changed()
         self.win.bkgd(" ", COLOR_PAIR["status_text"])
         self.win.erase()
-        line1 = "Currency: " + self.gox.currency + " | "
+        line1 = "Market: %s%s | " % (cbase, cquote)
         line1 += "Account: "
         if len(self.sorted_currency_list):
             for currency in self.sorted_currency_list:
-                line1 += currency + " " \
-                + goxapi.int2str(self.gox.wallet[currency], currency).strip() \
-                + " + "
+                if currency in self.gox.wallet:
+                    line1 += currency + " " \
+                    + goxapi.int2str(self.gox.wallet[currency], currency).strip() \
+                    + " + "
             line1 = line1.strip(" +")
         else:
             line1 += "No info (yet)"
@@ -514,10 +725,11 @@ class WinStatus(Win):
         else:
             str_ratio = "-"
 
-        line2 = "total bid: " + str_fiat + " " + self.gox.currency + " | "
-        line2 += "total ask: " +str_btc + " BTC | "
-        line2 += "ratio: " + str_ratio + " " + self.gox.currency + "/BTC | "
-        line2 += "lag: " + self.order_lag_txt
+        line2 = "sum_bid: %s %s | " % (str_fiat, cquote)
+        line2 += "sum_ask: %s %s | " % (str_btc, cbase)
+        line2 += "ratio: %s %s/%s | " % (str_ratio, cquote, cbase)
+        line2 += "o_lag: %s | " % self.order_lag_txt
+        line2 += "s_lag: %.3f s" % (self.gox.socket_lag / 1e6)
         self.addstr(0, 0, line1, COLOR_PAIR["status_text"])
         self.addstr(1, 0, line2, COLOR_PAIR["status_text"])
 
@@ -668,8 +880,8 @@ class DlgCancelOrders(DlgListItems):
 
         self.addstr(posy, 2, marker, attr)
         self.addstr(posy, 5, order.typ, attr)
-        self.addstr(posy, 9, goxapi.int2str(order.price, self.gox.currency), attr)
-        self.addstr(posy, 22, goxapi.int2str(order.volume, "BTC"), attr)
+        self.addstr(posy, 9, self.gox.quote2str(order.price), attr)
+        self.addstr(posy, 22, self.gox.base2str(order.volume), attr)
 
     def _do_cancel(self):
         """cancel all selected orders (or the order under cursor if empty)"""
@@ -784,7 +996,9 @@ class DlgNewOrder(Win):
         self.win.border()
         self.addstr(0, 1, " %s " % self.title, self.color)
         self.addstr(2, 2, " price", self.color)
+        self.addstr(2, 30, self.gox.curr_quote)
         self.addstr(4, 2, "volume", self.color)
+        self.addstr(4, 30, self.gox.curr_base)
         self.addstr(6, 2, "F10 ", self.color + curses.A_REVERSE)
         self.addstr("cancel ", self.color)
         self.addstr("Enter ", self.color + curses.A_REVERSE)
@@ -846,8 +1060,8 @@ class DlgNewOrderBid(DlgNewOrder):
             "New buy order")
 
     def do_submit(self, price, volume):
-        price = goxapi.float2int(price, self.gox.currency)
-        volume = goxapi.float2int(volume, "BTC")
+        price = self.gox.quote2int(price)
+        volume = self.gox.base2int(volume)
         self.gox.buy(price, volume)
 
 
@@ -859,8 +1073,8 @@ class DlgNewOrderAsk(DlgNewOrder):
             "New sell order")
 
     def do_submit(self, price, volume):
-        price = goxapi.float2int(price, self.gox.currency)
-        volume = goxapi.float2int(volume, "BTC")
+        price = self.gox.quote2int(price)
+        volume = self.gox.base2int(volume)
         self.gox.sell(price, volume)
 
 
@@ -946,13 +1160,62 @@ class StrategyManager():
                     reload(strategy_module)
                     strategy_object = strategy_module.Strategy(self.gox)
                     self.strategy_object_list.append(strategy_object)
+                    if hasattr(strategy_object, "name"):
+                        self.gox.strategies[strategy_object.name] = strategy_object
 
-                # pylint: disable=W0703
                 except Exception:
+                    self.gox.debug("### error while loading strategy %s.py, traceback follows:" % name)
                     self.gox.debug(traceback.format_exc())
 
             except ImportError:
-                self.gox.debug("### could not import %s.py" % name)
+                self.gox.debug("### could not import %s.py, traceback follows:" % name)
+                self.gox.debug(traceback.format_exc())
+
+
+def toggle_setting(gox, alternatives, option_name, direction):
+    """toggle a setting in the ini file"""
+    # pylint: disable=W0212
+    with goxapi.Signal._lock:
+        setting = gox.config.get_string("goxtool", option_name)
+        try:
+            newindex = (alternatives.index(setting) + direction) % len(alternatives)
+        except ValueError:
+            newindex = 0
+        gox.config.set("goxtool", option_name, alternatives[newindex])
+        gox.config.save()
+
+def toggle_depth_group(gox, direction):
+    """toggle the step width of the depth chart"""
+    if gox.curr_quote == "JPY":
+        alt = ["10", "25", "50", "100", "200", "500", "1000"]
+    else:
+        alt = ["0.1", "0.25", "0.5", "1", "2", "5", "10"]
+    toggle_setting(gox, alt, "depth_chart_group", direction)
+    gox.orderbook.signal_changed(gox.orderbook, None)
+
+def toggle_orderbook_group(gox, direction):
+    """toggle the group width of the orderbook"""
+    if gox.curr_quote == "JPY":
+        alt = ["0", "10", "25", "50", "100", "200", "500", "1000"]
+    else:
+        alt = ["0", "0.1", "0.25", "0.5", "1", "2", "5", "10"]
+    toggle_setting(gox, alt, "orderbook_group", direction)
+    gox.orderbook.signal_changed(gox.orderbook, None)
+
+def toggle_orderbook_sum(gox):
+    """toggle the summing in the orderbook on and off"""
+    alt = ["False", "True"]
+    toggle_setting(gox, alt, "orderbook_sum_total", 1)
+    gox.orderbook.signal_changed(gox.orderbook, None)
+
+def set_ini(gox, setting, value, signal, signal_sender, signal_params):
+    """set the ini value and then send a signal"""
+    # pylint: disable=W0212
+    with goxapi.Signal._lock:
+        gox.config.set("goxtool", setting, value)
+        gox.config.save()
+    signal(signal_sender, signal_params)
+
 
 
 #
@@ -961,37 +1224,46 @@ class StrategyManager():
 #
 
 def main():
-    """main funtion, called from within the curses.wrapper"""
+    """main funtion, called at the start of the program"""
 
+    debug_tb = []
     def curses_loop(stdscr):
-        """This code runs within curses environment"""
+        """Only the code inside this function runs within the curses wrapper"""
 
-        init_colors()
-
-        gox = goxapi.Gox(secret, config)
-
-        conwin = WinConsole(stdscr, gox)
-        bookwin = WinOrderBook(stdscr, gox)
-        statuswin = WinStatus(stdscr, gox)
-        chartwin = WinChart(stdscr, gox)
-
-        logwriter = LogWriter(gox)
-        printhook = PrintHook(gox)
-        strategy_manager = StrategyManager(gox, strat_mod_list)
-
-        gox.start()
+        # this function may under no circumstancs raise an exception, so I'm
+        # wrapping everything into try/except (should actually never happen
+        # anyways but when it happens during coding or debugging it would
+        # leave the terminal in an unusable state and this must be avoded).
+        # We have a list debug_tb[] where we can append tracebacks and
+        # after curses uninitialized properly and the terminal is restored
+        # we can print them.
         try:
+            init_colors()
+            gox = goxapi.Gox(secret, config)
+
+            logwriter = LogWriter(gox)
+            printhook = PrintHook(gox)
+
+            conwin = WinConsole(stdscr, gox)
+            bookwin = WinOrderBook(stdscr, gox)
+            statuswin = WinStatus(stdscr, gox)
+            chartwin = WinChart(stdscr, gox)
+
+
+            strategy_manager = StrategyManager(gox, strat_mod_list)
+
+            gox.start()
             while True:
                 key = conwin.win.getch()
                 if key == ord("q"):
                     break
-                if key == curses.KEY_F4:
+                elif key == curses.KEY_F4:
                     DlgNewOrderBid(stdscr, gox).modal()
-                if key == curses.KEY_F5:
+                elif key == curses.KEY_F5:
                     DlgNewOrderAsk(stdscr, gox).modal()
-                if key == curses.KEY_F6:
+                elif key == curses.KEY_F6:
                     DlgCancelOrders(stdscr, gox).modal()
-                if key == curses.KEY_RESIZE:
+                elif key == curses.KEY_RESIZE:
                     # pylint: disable=W0212
                     with goxapi.Signal._lock:
                         stdscr.erase()
@@ -1000,25 +1272,77 @@ def main():
                         bookwin.resize()
                         chartwin.resize()
                         statuswin.resize()
-                    continue
-                if key == ord("l"):
+                elif key == ord("l"):
                     strategy_manager.reload()
-                    continue
-                if key > ord("a") and key < ord("z"):
+
+                # which chart to show on the right side
+                elif key == ord("H"):
+                    set_ini(gox, "display_right", "history_chart",
+                        gox.history.signal_changed, gox.history, None)
+                elif key == ord("D"):
+                    set_ini(gox, "display_right", "depth_chart",
+                        gox.orderbook.signal_changed, gox.orderbook, None)
+
+                #  depth chart step
+                elif key == ord(","): # zoom out
+                    toggle_depth_group(gox, +1)
+                elif key == ord("."): # zoom in
+                    toggle_depth_group(gox, -1)
+
+                # orderbook grouping step
+                elif key == ord("-"): # zoom out (larger step)
+                    toggle_orderbook_group(gox, +1)
+                elif key == ord("+"): # zoom in (smaller step)
+                    toggle_orderbook_group(gox, -1)
+
+                elif key == ord("S"):
+                    toggle_orderbook_sum(gox)
+
+                # lowercase keys go to the strategy module
+                elif key > ord("a") and key < ord("z"):
                     gox.signal_keypress(gox, (key))
+                else:
+                    gox.debug("key pressed: key=%i" % key)
 
         except KeyboardInterrupt:
             gox.debug("got Ctrl+C, trying to shut down cleanly.")
             gox.debug("Hint: did you know you can also exit with 'q'?")
+
         except Exception:
-            gox.debug(traceback.format_exc())
+            debug_tb.append(traceback.format_exc())
 
-        strategy_manager.unload()
-        gox.stop()
-        printhook.close()
-        logwriter.close()
-        # The End.
+        # Now trying to shutdown everything in an orderly manner.
+        # Since we are still inside curses but we don't know whether
+        # the printhook or the logwriter was initialized properly already
+        # or whether it crashed earlier we cannot print here and we also
+        # cannot log, so we put all tracebacks into the debug_tb list to
+        # print them later once the terminal is properly restored again.
+        try:
+            strategy_manager.unload()
+        except Exception:
+            debug_tb.append(traceback.format_exc())
 
+        try:
+            gox.stop()
+        except Exception:
+            debug_tb.append(traceback.format_exc())
+
+        try:
+            printhook.close()
+        except Exception:
+            debug_tb.append(traceback.format_exc())
+
+        try:
+            logwriter.close()
+        except Exception:
+            debug_tb.append(traceback.format_exc())
+
+        # Curses loop ends here, we must reach this point under all circumstances.
+        # Now curses will uninitialize itself and restore the terminal.
+
+
+    # Here it begins. The very first thing is to always set US or GB locale
+    # to have always the same well defined behavior for number formatting.
     for loc in ["en_US.UTF8", "en_GB.UTF8", "en_EN", "en_GB", "C"]:
         try:
             locale.setlocale(locale.LC_NUMERIC, loc)
@@ -1036,16 +1360,25 @@ def main():
         help="name of strategy module files, comma separated list, default=strategy.py")
     argp.add_argument('--protocol', action="store", default="",
         help="force protocol (socketio or websocket), ignore setting in .ini")
-    argp.add_argument('--no-fulldepth', action="store_true", default="",
+    argp.add_argument('--no-fulldepth', action="store_true", default=False,
         help="do not download full depth (useful for debugging)")
-    argp.add_argument('--no-history', action="store_true", default="",
+    argp.add_argument('--no-history', action="store_true", default=False,
         help="do not download full history (useful for debugging)")
-    argp.add_argument('--use-http', action="store_true", default="",
-        help="use http api for trading (useful when socketio is lagging like hell")
+    argp.add_argument('--use-http', action="store_true", default=False,
+        help="use http api for trading (more reliable, recommended")
+    argp.add_argument('--no-http', action="store_true", default=False,
+        help="use streaming api for trading (problematic when streaming api disconnects often)")
+    argp.add_argument('--password', action="store", default=None,
+        help="password for decryption of stored key. This is a dangerous option "
+            +"because the password might end up being stored in the history file "
+            +"of your shell, for example in ~/.bash_history. Use this only when "
+            +"starting it from within a script and then of course you need to "
+            +"keep this start script in a secure place!")
     args = argp.parse_args()
 
     config = goxapi.GoxConfig("goxtool.ini")
     secret = goxapi.Secret(config)
+    secret.password_from_commandline_option = args.password
     if args.add_secret:
         # prompt for secret, encrypt, write to .ini and then exit the program
         secret.prompt_encrypt()
@@ -1055,13 +1388,20 @@ def main():
         goxapi.FORCE_NO_FULLDEPTH = args.no_fulldepth
         goxapi.FORCE_NO_HISTORY = args.no_history
         goxapi.FORCE_HTTP_API = args.use_http
+        goxapi.FORCE_NO_HTTP_API = args.no_http
+
+        # if its ok then we can finally enter the curses main loop
         if secret.prompt_decrypt() != secret.S_FAIL_FATAL:
             curses.wrapper(curses_loop)
-            print
-            print "*******************************************************"
-            print "*  Please donate: 1D7ELjGofBiRUJNwK55DVC3XWYjfN77CA3  *"
-            print "*******************************************************"
-
+            if len(debug_tb):
+                print "\n\n*** error(s) in curses_loop() that caused unclean shutdown:\n"
+                for trb in debug_tb:
+                    print trb
+            else:
+                print
+                print "*******************************************************"
+                print "*  Please donate: 1C8aDabADaYvTKvCAG1htqYcEgpAhkeYoW  *"
+                print "*******************************************************"
 
 if __name__ == "__main__":
     main()

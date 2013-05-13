@@ -758,7 +758,7 @@ class BaseClient(BaseObject):
                     break
                 data  += history["data"]
                 querystring = "?since=" + data[-1]["tid"]
-                self.debug("download: %d (seconds behind)" % (int(time.mktime(endtime.timetuple())) - int(data[-1]["date"])))
+                self.debug("download: %2.2f (days behind)" % ((time.mktime(endtime.timetuple()) - data[-1]["date"])/86400))
                 if int(data[-1]["date"]) > int(time.mktime(endtime.timetuple())):
                      break
             if history["result"] == "success":

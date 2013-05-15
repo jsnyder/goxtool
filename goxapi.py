@@ -748,21 +748,26 @@ class BaseClient(BaseObject):
             proto = {True: "https", False: "http"}[use_ssl]
             data = []
             while True:
-                json_hist = http_request("%s://%s/api/2/%s%s/money/trades%s" % (
-                    proto,
-                    HTTP_HOST,
-                    self.curr_base,
-                    self.curr_quote,
-                    querystring
-                ))
-                history = json.loads(json_hist)
-                if len(history["data"]) == 0:
-                    break
-                data  += history["data"]
-                querystring = "?since=" + data[-1]["tid"]
-                self.debug("download: %2.2f (days behind)" % ((time.mktime(endtime.timetuple()) - data[-1]["date"])/86400))
-                if int(data[-1]["date"]) > int(time.mktime(endtime.timetuple())):
-                     break
+                try:
+                    json_hist = http_request("%s://%s/api/2/%s%s/money/trades%s" % (
+                        proto,
+                        HTTP_HOST,
+                        self.curr_base,
+                        self.curr_quote,
+                        querystring
+                    ))
+                    history = json.loads(json_hist)
+                    if len(history["data"]) == 0:
+                        break
+                    data  += history["data"]
+                    querystring = "?since=" + data[-1]["tid"]
+                    self.debug("download: %2.2f (days behind)" % ((time.mktime(endtime.timetuple()) - data[-1]["date"])/86400))
+                    if int(data[-1]["date"]) > int(time.mktime(endtime.timetuple())):
+                        break
+                except ValueError:
+                    self.debug("download: bad response, retrying")
+                    time.sleep(1)
+
             if history["result"] == "success":
                 self.signal_fullhistory(self, data)
 

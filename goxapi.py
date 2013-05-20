@@ -155,6 +155,7 @@ class GoxConfig(SafeConfigParser):
                 ,["gox", "use_ssl", "True"]
                 ,["gox", "use_plain_old_websocket", "True"]
                 ,["gox", "use_http_api", "True"]
+                ,["gox", "use_tonce", "False"]
                 ,["gox", "load_fulldepth", "True"]
                 ,["gox", "load_history", "True"]
                 ,["gox", "history_timeframe", "15"]
@@ -617,7 +618,7 @@ class History(BaseObject):
 class BaseClient(BaseObject):
     """abstract base class for SocketIOClient and WebsocketClient"""
 
-    _last_nonce = 0
+    _last_unique_microtime = 0
     _nonce_lock = threading.Lock()
 
     def __init__(self, curr_base, curr_quote, secret, config):
@@ -677,14 +678,14 @@ class BaseClient(BaseObject):
         websocket. Each client class will override this send method"""
         raise NotImplementedError()
 
-    def get_nonce(self):
+    def get_unique_mirotime(self):
         """produce a unique nonce that is guaranteed to be ever increasing"""
         with self._nonce_lock:
-            nonce = int(time.time() * 1E6)
-            if nonce <= self._last_nonce:
-                nonce = self._last_nonce + 1
-            self._last_nonce = nonce
-            return nonce
+            microtime = int(time.time() * 1E6)
+            if microtime <= self._last_unique_microtime:
+                microtime = self._last_unique_microtime + 1
+            self._last_unique_microtime = microtime
+            return microtime
 
     def use_http(self):
         """should we use http api? return true if yes"""
@@ -694,6 +695,14 @@ class BaseClient(BaseObject):
         if FORCE_NO_HTTP_API:
             use_http = False
         return use_http
+
+    def use_tonce(self):
+        """should we use tonce instead on nonce? tonce is current microtime
+        and also works when messages come out of order (which happens at
+        the mtgox server in certain siuations). They still have to be unique
+        because mtgox will remember all recently used tonce values. It will
+        only be accepted when the local clock is +/- 10 seconds exact."""
+        return self.config.get_bool("gox", "use_tonce")
 
     def request_fulldepth(self):
         """start the fulldepth thread"""
@@ -874,7 +883,11 @@ class BaseClient(BaseObject):
         key = self.secret.key
         sec = self.secret.secret
 
-        params["nonce"] = self.get_nonce()
+        if self.use_tonce():
+            params["tonce"] = self.get_unique_mirotime()
+        else:
+            params["nonce"] = self.get_unique_mirotime()
+
         post = urlencode(params)
         prefix = api_endpoint + chr(0)
         # pylint: disable=E1101
@@ -906,16 +919,18 @@ class BaseClient(BaseObject):
         key = self.secret.key
         sec = self.secret.secret
 
-        nonce = self.get_nonce()
-
-        call = json.dumps({
+        call = {
             "id"       : reqid,
             "call"     : api_endpoint,
-            "nonce"    : nonce,
             "params"   : params,
             "currency" : self.curr_quote,
             "item"     : self.curr_base
-        })
+        }
+        if self.use_tonce():
+            call["tonce"] = self.get_unique_mirotime()
+        else:
+            call["nonce"] = self.get_unique_mirotime()
+        call = json.dumps(call)
 
         # pylint: disable=E1101
         sign = hmac.new(base64.b64decode(sec), call, hashlib.sha512).digest()
@@ -1878,12 +1893,12 @@ class OrderBook(BaseObject):
 
     def _update_total_ask(self, volume):
         """update total volume of base currency on the ask side"""
-        self.total_ask += int2float(volume, self.gox.curr_base)
+        self.total_ask += self.gox.base2float(volume)
 
     def _update_total_bid(self, volume, price):
         """update total volume of quote currency on the bid side"""
         self.total_bid += \
-            int2float(volume, self.gox.curr_base) * int2float(price, self.gox.curr_quote)
+            self.gox.base2float(volume) * self.gox.quote2float(price)
 
     def _update_level_own_volume(self, typ, price, own_volume):
         """update the own_volume cache in the Level object at price"""
